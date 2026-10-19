@@ -1,0 +1,21 @@
+{
+  "name": "india-job-hub",
+  "version": "1.0.0",
+  "description": "India and remote job aggregator for SAP ABAP, AWS DevOps, Tosca Testing and Quadient Inspire",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "express-rate-limit": "^7.5.0",
+    "dotenv": "^16.4.7",
+    "@aws-sdk/client-dynamodb": "^3.800.0",
+    "@aws-sdk/lib-dynamodb": "^3.800.0",
+    "aws-jwt-verify": "^5.1.0"
+  }
+}
