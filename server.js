@@ -4,6 +4,10 @@ const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
+const multer = require('multer');
+const mammoth = require('mammoth');
+const pdfParse = require('pdf-parse');
+
 const crypto = require('crypto');
 const { CognitoJwtVerifier } = require('aws-jwt-verify');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
@@ -259,6 +263,197 @@ app.get('/api/jobs', requireConfigured, authenticated, activeSubscription, async
     note: 'Only listings with a parseable posting date inside the selected window are shown. Results depend on provider API coverage and terms. Portal links open official search pages; this app does not scrape LinkedIn or Naukri.'
   });
 });
+
+// ATS_ANALYZER_INTEGRATION_V1
+const atsUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (!['.pdf', '.docx', '.txt'].includes(ext)) {
+      return cb(new Error('Upload a PDF, DOCX, or TXT resume.'));
+    }
+    cb(null, true);
+  }
+});
+
+const ATS_SKILLS = [
+  'aws', 'amazon web services', 'terraform', 'jenkins', 'docker',
+  'kubernetes', 'linux', 'python', 'bash', 'ci/cd', 'github actions',
+  'cloudformation', 'ec2', 's3', 'iam', 'vpc', 'lambda', 'cloudwatch',
+  'sql', 'etl', 'data warehouse', 'data quality', 'testing', 'automation',
+  'tosca', 'tricentis', 'sap', 'abap', 'quadient', 'inspire',
+  'communication', 'leadership', 'agile', 'git', 'ansible', 'prometheus',
+  'grafana', 'incident management', 'monitoring', 'deployment'
+];
+
+function atsNormalize(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9+#./\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function atsContains(text, term) {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('(^|[^a-z0-9])' + escaped + '([^a-z0-9]|$)', 'i').test(text);
+}
+
+function atsExtractTerms(value) {
+  const normalized = atsNormalize(value);
+  const fromSkills = ATS_SKILLS.filter(skill => atsContains(normalized, skill));
+  const ignored = new Set([
+    'with','from','that','this','have','will','your','role','work','team',
+    'years','using','used','into','responsible','experience','required',
+    'skills','ability','strong'
+  ]);
+  const counts = new Map();
+
+  for (const word of normalized.split(' ')) {
+    if (word.length >= 4 && !ignored.has(word)) {
+      counts.set(word, (counts.get(word) || 0) + 1);
+    }
+  }
+
+  const frequent = [...counts.entries()]
+    .filter(([, count]) => count >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([word]) => word);
+
+  return [...new Set([...fromSkills, ...frequent])].slice(0, 35);
+}
+
+async function atsExtractResumeText(file) {
+  const ext = path.extname(file.originalname || '').toLowerCase();
+
+  if (ext === '.txt') return file.buffer.toString('utf8');
+
+  if (ext === '.docx') {
+    const result = await mammoth.extractRawText({ buffer: file.buffer });
+    return result.value || '';
+  }
+
+  if (ext === '.pdf') {
+    const result = await pdfParse(file.buffer);
+    return result.text || '';
+  }
+
+  throw new Error('Unsupported resume format.');
+}
+
+app.post(
+  '/api/ats/analyze',
+  requireConfigured,
+  authenticated,
+  activeSubscription,
+  (req, res, next) => {
+    atsUpload.single('resume')(req, res, err => {
+      if (!err) return next();
+
+      if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'Resume must be 5 MB or smaller.' });
+      }
+
+      return res.status(400).json({ error: err.message || 'Invalid upload.' });
+    });
+  },
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'Please upload a resume file.' });
+      }
+
+      const resumeText = await atsExtractResumeText(req.file);
+
+      if (!resumeText.trim()) {
+        return res.status(400).json({
+          error: 'No readable text found. If this is a scanned PDF, use an OCR-readable version.'
+        });
+      }
+
+      const jobDescription = String(req.body.jobDescription || '').slice(0, 30000);
+      const normalizedResume = atsNormalize(resumeText);
+
+      const jobTerms = jobDescription.trim()
+        ? atsExtractTerms(jobDescription)
+        : ATS_SKILLS.filter(skill => atsContains(normalizedResume, skill));
+
+      const matchedKeywords = jobTerms.filter(term => atsContains(normalizedResume, term));
+      const missingKeywords = jobTerms.filter(term => !matchedKeywords.includes(term));
+
+      const keywordScore = jobTerms.length
+        ? Math.round(matchedKeywords.length / jobTerms.length * 100)
+        : 0;
+
+      const sectionChecks = [
+        ['contact details', /email|@|phone|mobile|linkedin/i.test(resumeText)],
+        ['work experience', /experience|employment|professional history/i.test(resumeText)],
+        ['skills section', /skills|technologies|technical expertise/i.test(resumeText)],
+        ['education', /education|university|college|degree|bachelor|master/i.test(resumeText)]
+      ];
+
+      const sectionScore = Math.round(
+        sectionChecks.filter(([, found]) => found).length / sectionChecks.length * 100
+      );
+
+      const score = jobDescription.trim()
+        ? Math.round(keywordScore * 0.8 + sectionScore * 0.2)
+        : sectionScore;
+
+      const recommendations = [];
+
+      if (!sectionChecks[0][1]) recommendations.push(
+        'Add clear contact details, including a professional email address.'
+      );
+      if (!sectionChecks[1][1]) recommendations.push(
+        'Add a clearly labelled work experience section with achievements.'
+      );
+      if (!sectionChecks[2][1]) recommendations.push(
+        'Add a skills section using relevant skills you genuinely have.'
+      );
+      if (!sectionChecks[3][1]) recommendations.push(
+        'Add your education and relevant certifications.'
+      );
+      if (jobDescription.trim() && missingKeywords.length) recommendations.push(
+        'Where accurate, reflect relevant missing job-description terms in your skills or experience.'
+      );
+      if (!jobDescription.trim()) recommendations.push(
+        'Paste a target job description for a more useful keyword comparison.'
+      );
+      if (resumeText.length < 500) recommendations.push(
+        'Your resume text looks short; check that the entire resume was extracted.'
+      );
+      if (!recommendations.length) recommendations.push(
+        'Keep the resume tailored to the role and support skills with measurable achievements.'
+      );
+
+      res.set('Cache-Control', 'no-store');
+      return res.json({
+        score,
+        summary: jobDescription.trim()
+          ? `Estimated score ${score}/100 using keyword coverage and basic section checks. This is not an employer ATS score.`
+          : `Basic resume structure score ${score}/100. Add a job description for keyword comparison.`,
+        matchedKeywords,
+        missingKeywords,
+        recommendations,
+        metrics: {
+          keywordCoverage: keywordScore,
+          sectionCoverage: sectionScore,
+          extractedCharacters: resumeText.length
+        }
+      });
+    } catch (error) {
+      // Never log resume text or the uploaded document itself.
+      console.error('ATS analysis error:', error.message);
+      return res.status(400).json({
+        error: 'Unable to read this resume. Check the file format and try again.'
+      });
+    }
+  }
+);
+
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`India Job Hub running on port ${PORT}`);

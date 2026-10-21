@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ATS Resume Analyzer | India Job Hub</title>
+<style>
+:root{font-family:Inter,Arial,sans-serif;color:#15365b;background:#f4f8fd}
+*{box-sizing:border-box}body{margin:0}header{display:flex;justify-content:space-between;align-items:center;padding:18px 5%;background:white;border-bottom:1px solid #dce8f5}a{color:#0877ef;text-decoration:none}
+main{max-width:1000px;margin:34px auto;padding:0 18px}.hero{padding:28px;border-radius:18px;background:linear-gradient(120deg,#dceeff,#f4eaff);margin-bottom:20px}
+h1{font-size:clamp(28px,4vw,40px);margin:0 0 10px}.muted{color:#617995;line-height:1.6}.card{background:white;border:1px solid #dce8f5;border-radius:15px;padding:24px;margin-bottom:18px}
+label{display:block;font-weight:700;margin:18px 0 8px}input,textarea{width:100%;padding:13px;border:1px solid #cbd9e9;border-radius:9px;font:inherit}textarea{min-height:170px;resize:vertical}
+button{background:#0877ef;color:white;border:0;border-radius:9px;padding:13px 18px;font-weight:700;cursor:pointer;margin-top:16px}button:disabled{opacity:.6}
+.status{white-space:pre-wrap;margin-top:15px}.error{color:#b42318}.success{color:#087443}.score{font-size:46px;color:#087b54;font-weight:800}.grid{display:grid;grid-template-columns:1fr 1fr;gap:15px}.tag{display:inline-block;background:#eaf4ff;border-radius:20px;padding:7px 10px;margin:4px;font-size:13px}.metric{background:#f4f8fd;border-radius:10px;padding:14px}.metric strong{font-size:22px;display:block;margin-top:7px}li{margin:8px 0;line-height:1.5}
+@media(max-width:650px){.grid{grid-template-columns:1fr}.card{padding:17px}header{gap:10px;flex-wrap:wrap}}
+</style>
+</head>
+<body>
+<header><strong>🇮🇳 India Job Hub · ATS Analyzer</strong><a href="/">← Back to Home</a></header>
+<main>
+<section class="hero"><h1>Make your resume job-ready</h1><div class="muted">Compare your resume with a job description, review keyword coverage, and get practical improvement suggestions.</div></section>
+<section class="card">
+<h2>Analyze your resume</h2>
+<p class="muted">PDF, DOCX and TXT are supported. Maximum file size: 5 MB. Your resume is processed by this server for this request and is not saved by this starter application.</p>
+<form id="form">
+<label for="resume">Resume file</label><input id="resume" name="resume" type="file" accept=".pdf,.docx,.txt" required>
+<label for="jobDescription">Job description (recommended)</label><textarea id="jobDescription" name="jobDescription" maxlength="30000" placeholder="Paste the job description here..."></textarea>
+<button id="submit" type="submit">Analyze Resume</button><div id="status" class="status" role="status"></div>
+</form>
+</section>
+<section id="results" class="card" hidden>
+<h2>Your results</h2><div id="score" class="score"></div><p id="summary" class="muted"></p>
+<div class="grid"><div class="metric">Keyword coverage<strong id="keywordScore">—</strong></div><div class="metric">Resume section checks<strong id="sectionScore">—</strong></div></div>
+<div class="grid">
+<div><h3>Matching keywords</h3><div id="matched"></div></div>
+<div><h3>Keywords to consider</h3><div id="missing"></div></div>
+</div>
+<h3>Recommendations</h3><ul id="recommendations"></ul>
+<p class="muted">This is a transparent, basic estimate—not a guarantee of how an employer's ATS will score your application. Only include skills and experience you genuinely have.</p>
+</section>
+</main>
+<script>
+const form=document.getElementById("form"),statusBox=document.getElementById("status"),button=document.getElementById("submit"),results=document.getElementById("results");
+function tags(id,items){const el=document.getElementById(id);el.replaceChildren();if(!items?.length){el.textContent="None identified.";return;}items.forEach(x=>{const s=document.createElement("span");s.className="tag";s.textContent=x;el.appendChild(s);});}
+form.addEventListener("submit",async e=>{e.preventDefault();const file=document.getElementById("resume").files[0];if(!file)return;
+if(!/\.(pdf|docx|txt)$/i.test(file.name)){statusBox.textContent="Choose a PDF, DOCX or TXT file.";statusBox.className="status error";return;}
+const body=new FormData();body.append("resume",file);body.append("jobDescription",document.getElementById("jobDescription").value);
+button.disabled=true;button.textContent="Analyzing…";statusBox.textContent="Analyzing resume…";statusBox.className="status";results.hidden=true;
+try{const r=await fetch("/api/ats/analyze",{method:"POST",body,credentials:"same-origin"});const d=await r.json();if(!r.ok)throw new Error(d.error||"Analysis failed.");
+document.getElementById("score").textContent=d.score+"/100";document.getElementById("summary").textContent=d.summary||"Analysis complete.";
+document.getElementById("keywordScore").textContent=(d.metrics?.keywordCoverage??"—")+"%";document.getElementById("sectionScore").textContent=(d.metrics?.sectionCoverage??"—")+"%";
+tags("matched",d.matchedKeywords);tags("missing",d.missingKeywords);
+const ul=document.getElementById("recommendations");ul.replaceChildren();(d.recommendations||[]).forEach(x=>{const li=document.createElement("li");li.textContent=x;ul.appendChild(li);});
+results.hidden=false;statusBox.textContent="Analysis complete.";statusBox.className="status success";
+}catch(err){statusBox.textContent=err.message;statusBox.className="status error";}finally{button.disabled=false;button.textContent="Analyze Resume";}
+});
+</script>
+</body>
+</html>
