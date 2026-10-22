@@ -619,6 +619,18 @@
       .tool-link { border-left: 0; border-top: 1px solid #cfe5ff; }
       .trust-strip { grid-template-columns: 1fr; }
     }
+
+    .profile-section { margin:28px 0; padding:26px; background:#fff; border:1px solid #dce6f2; border-radius:18px; }
+    .profile-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-top:20px; }
+    .profile-field { display:flex; flex-direction:column; gap:7px; min-width:0; }
+    .profile-field.full-width { grid-column:1 / -1; }
+    .profile-field label { font-size:13px; font-weight:700; color:#243c5a; }
+    .profile-field input, .profile-field textarea { width:100%; box-sizing:border-box; padding:12px; border:1px solid #ccd8e7; border-radius:9px; }
+    .profile-field textarea { min-height:90px; resize:vertical; }
+    .profile-help { color:#6680a3; font-size:12px; line-height:1.5; }
+    #profileStatus { margin-top:14px; font-size:13px; line-height:1.5; }
+    @media (max-width:650px) { .profile-grid { grid-template-columns:1fr; } .profile-field.full-width { grid-column:auto; } .profile-section { padding:18px; } }
+
   </style>
 </head>
 
@@ -634,6 +646,7 @@
 
     <nav class="nav">
       <a class="active" href="/">Home</a>
+      <a href="#profileSection" onclick="loadProfile()">My Profile</a>
       <a href="#jobs">Browse Jobs</a>
       <a href="#ats">ATS Analyzer</a>
       <a href="/applications">My Applications</a>
@@ -828,6 +841,65 @@
       </aside>
     </div>
 
+
+    <section class="profile-section" id="profileSection">
+      <h2>My Profile</h2>
+      <p class="profile-help">Save your job-search preferences and reusable application email template.</p>
+      <div id="profileStatus" role="status" aria-live="polite">Select My Profile to load your saved details.</div>
+      <form id="profileForm" onsubmit="saveProfile(event)">
+        <div class="profile-grid">
+          <div class="profile-field">
+            <label for="profileUsername">Username / name</label>
+            <input id="profileUsername" maxlength="80" required autocomplete="name">
+          </div>
+          <div class="profile-field">
+            <label for="profileExperience">Years of experience</label>
+            <input id="profileExperience" type="number" min="0" max="60" step="0.5" required>
+          </div>
+          <div class="profile-field full-width">
+            <label for="profileSkills">Skills</label>
+            <textarea id="profileSkills" maxlength="2000" placeholder="AWS, Terraform, Docker, Kubernetes, Jenkins"></textarea>
+          </div>
+          <div class="profile-field">
+            <label for="profileRoles">Preferred roles</label>
+            <textarea id="profileRoles" maxlength="1000" placeholder="AWS DevOps Engineer, Cloud Engineer"></textarea>
+          </div>
+          <div class="profile-field">
+            <label for="profileLocations">Preferred locations</label>
+            <textarea id="profileLocations" maxlength="1000" placeholder="Hyderabad, Bengaluru, Remote"></textarea>
+          </div>
+          <div class="profile-field full-width">
+            <label for="profileEmailTemplate">Application email template</label>
+            <textarea id="profileEmailTemplate" maxlength="4000" placeholder="Dear Hiring Team,&#10;&#10;My name is {{username}}.&#10;&#10;Regards,&#10;{{username}}"></textarea>
+            <span class="profile-help">Use {{username}} as a placeholder. Saving this template does not send emails.</span>
+          </div>
+        </div>
+        <button class="primary" id="saveProfileButton" type="submit" style="margin-top:18px">Save Profile</button>
+      </form>
+
+      <div class="profile-field full-width" id="gmailConnectionSection" style="margin-top:24px">
+        <h3>Gmail Connection</h3>
+        <p class="profile-help">
+          Connect your own Gmail account to prepare for sending job application emails.
+          India Job Hub will request permission to send email on your behalf.
+        </p>
+        <div id="gmailStatus" role="status" aria-live="polite">
+          Check your Gmail connection status here.
+        </div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
+          <a class="primary" id="connectGmailButton"
+             href="/auth/google"
+             style="display:inline-block;text-decoration:none">
+            Connect Gmail
+          </a>
+          <button class="secondary" id="disconnectGmailButton"
+                  type="button" onclick="disconnectGmail()" hidden>
+            Disconnect Gmail
+          </button>
+        </div>
+      </div>
+    </section>
+
     <section class="trust-strip">
       <div class="trust-item"><span class="big-icon">🛡️</span><span><strong>Secure & Trusted</strong><small>Account-aware access</small></span></div>
       <div class="trust-item"><span class="big-icon">⚡</span><span><strong>Relevant Opportunities</strong><small>Focused job categories</small></span></div>
@@ -852,7 +924,38 @@
     </div>
   </footer>
 
-  <script>
+
+  <dialog id="applicationEmailDialog"
+          aria-labelledby="applicationEmailTitle"
+          style="width:min(620px,calc(100% - 32px));max-height:85vh;overflow:auto;border:1px solid #ccd8e7;border-radius:16px;padding:24px;box-sizing:border-box">
+    <h2 id="applicationEmailTitle">Review Application Email</h2>
+    <p class="profile-help">Review the recipient and message carefully. This sends an email from your connected Gmail account.</p>
+    <form id="applicationEmailForm" onsubmit="sendApplicationEmail(event)">
+      <div class="profile-field">
+        <label for="applicationEmailTo">Employer email address</label>
+        <input id="applicationEmailTo" type="email" maxlength="254"
+               required autocomplete="email"
+               placeholder="Enter the employer's email address">
+      </div>
+      <div class="profile-field" style="margin-top:14px">
+        <label for="applicationEmailSubject">Subject</label>
+        <input id="applicationEmailSubject" maxlength="180" required>
+      </div>
+      <div class="profile-field" style="margin-top:14px">
+        <label for="applicationEmailBody">Message</label>
+        <textarea id="applicationEmailBody" maxlength="10000"
+                  required style="min-height:220px"></textarea>
+      </div>
+      <div id="applicationEmailStatus" role="status" aria-live="polite"
+           style="margin-top:12px"></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:18px">
+        <button class="primary" id="sendApplicationEmailButton" type="submit">Confirm and Send Email</button>
+        <button class="secondary" type="button" onclick="closeApplicationEmail()">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+<script>
     let selectedCategory = "AWS DevOps";
     let allJobs = [];
 
@@ -866,6 +969,129 @@
     const $ = id => document.getElementById(id);
 
     $("year").textContent = new Date().getFullYear();
+
+
+    async function loadProfile() {
+      loadGmailStatus();
+      const status = $("profileStatus");
+      if (!status) return;
+      status.textContent = "Loading your profile...";
+      try {
+        const r = await fetch("/api/profile", { credentials:"same-origin", cache:"no-store" });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          status.textContent = d.error || (r.status === 401 ? "Please log in first." : "Unable to load profile.");
+          return;
+        }
+        const v = d.profile || {};
+        $("profileUsername").value = v.username || "";
+        $("profileExperience").value = v.yearsExperience ?? "";
+        $("profileSkills").value = v.skills || "";
+        $("profileRoles").value = v.preferredRoles || "";
+        $("profileLocations").value = v.preferredLocations || "";
+        $("profileEmailTemplate").value = v.emailTemplate || "";
+        status.textContent = "Profile loaded. Save any changes you make.";
+      } catch (_) {
+        status.textContent = "Could not reach the profile service. Please try again.";
+      }
+    }
+
+    async function saveProfile(event) {
+      event.preventDefault();
+      const button = $("saveProfileButton");
+      const status = $("profileStatus");
+      button.disabled = true;
+      status.textContent = "Saving your profile...";
+      try {
+        const r = await fetch("/api/profile", {
+          method:"PUT", credentials:"same-origin", cache:"no-store",
+          headers:{"Content-Type":"application/json","Accept":"application/json"},
+          body:JSON.stringify({
+            username:$("profileUsername").value,
+            yearsExperience:$("profileExperience").value,
+            skills:$("profileSkills").value,
+            preferredRoles:$("profileRoles").value,
+            preferredLocations:$("profileLocations").value,
+            emailTemplate:$("profileEmailTemplate").value
+          })
+        });
+        const d = await r.json().catch(() => ({}));
+        status.textContent = r.ok ? "Profile saved successfully." : (d.error || "Unable to save profile.");
+      } catch (_) {
+        status.textContent = "Could not reach the profile service. Please try again.";
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function loadGmailStatus() {
+      const status = $("gmailStatus");
+      const connectButton = $("connectGmailButton");
+      const disconnectButton = $("disconnectGmailButton");
+      if (!status || !connectButton || !disconnectButton) return;
+
+      status.textContent = "Checking Gmail connection...";
+      connectButton.hidden = false;
+      disconnectButton.hidden = true;
+
+      try {
+        const r = await fetch("/api/gmail/status", {
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "Accept": "application/json" }
+        });
+        const d = await r.json().catch(() => ({}));
+
+        if (!r.ok) {
+          status.textContent = r.status === 401
+            ? "Please log in to manage your Gmail connection."
+            : (d.error || "Unable to check Gmail connection. Please log in and try again.");
+          return;
+        }
+
+        if (d.connected && d.email) {
+          status.textContent = "Connected Gmail: " + d.email;
+          connectButton.textContent = "Reconnect Gmail";
+          disconnectButton.hidden = false;
+        } else {
+          status.textContent = "Gmail is not connected.";
+          connectButton.textContent = "Connect Gmail";
+        }
+      } catch (_) {
+        status.textContent = "Could not check Gmail connection. Please try again.";
+      }
+    }
+
+    async function disconnectGmail() {
+      const status = $("gmailStatus");
+      const button = $("disconnectGmailButton");
+      if (!confirm("Disconnect your Gmail account from India Job Hub?")) return;
+
+      button.disabled = true;
+      status.textContent = "Disconnecting Gmail...";
+      try {
+        const r = await fetch("/api/gmail/disconnect", {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "Accept": "application/json" }
+        });
+        const d = await r.json().catch(() => ({}));
+
+        if (!r.ok) {
+          status.textContent = d.error || "Unable to disconnect Gmail. Please try again.";
+          return;
+        }
+
+        status.textContent = "Gmail disconnected successfully.";
+        $("connectGmailButton").textContent = "Connect Gmail";
+        button.hidden = true;
+      } catch (_) {
+        status.textContent = "Could not reach the service. Please try again.";
+      } finally {
+        button.disabled = false;
+      }
+    }
 
     function handleAuth() {
       // Uses the existing login route in your application.
@@ -973,6 +1199,111 @@
       return "";
     }
 
+
+    let currentEmailJob = null;
+
+    function openApplicationEmail(job) {
+      currentEmailJob = job;
+
+      const username = $("profileUsername").value.trim() || "Applicant";
+      const company = String(job.company || "the company");
+      const title = String(job.title || "the advertised position");
+
+      $("applicationEmailTo").value = "";
+      $("applicationEmailSubject").value = "Application for " + title;
+
+      let message = $("profileEmailTemplate").value.trim();
+      if (!message) {
+        message = "Dear Hiring Team,\n\nI am interested in the " + title +
+          " position at " + company + ".\n\nRegards,\n" + username;
+      } else {
+        message = message
+          .split("{{username}}").join(username)
+          .split("{{jobTitle}}").join(title)
+          .split("{{company}}").join(company);
+      }
+
+      $("applicationEmailBody").value = message;
+      $("applicationEmailStatus").textContent =
+        "Job: " + title + " at " + company +
+        ". The employer's email address must be entered manually.";
+
+      const dialog = $("applicationEmailDialog");
+      if (typeof dialog.showModal === "function") {
+        dialog.showModal();
+      } else {
+        dialog.setAttribute("open", "");
+      }
+      $("applicationEmailTo").focus();
+    }
+
+    function closeApplicationEmail() {
+      const dialog = $("applicationEmailDialog");
+      if (typeof dialog.close === "function") {
+        dialog.close();
+      } else {
+        dialog.removeAttribute("open");
+      }
+      currentEmailJob = null;
+    }
+
+    async function sendApplicationEmail(event) {
+      event.preventDefault();
+
+      if (!currentEmailJob) {
+        $("applicationEmailStatus").textContent =
+          "Please close this form and open it again from a job listing.";
+        return;
+      }
+
+      const to = $("applicationEmailTo").value.trim();
+      const subject = $("applicationEmailSubject").value.trim();
+      const body = $("applicationEmailBody").value;
+      if (!to || !subject || !body.trim()) {
+        $("applicationEmailStatus").textContent =
+          "Enter the recipient, subject, and message before sending.";
+        return;
+      }
+
+      if (!confirm("Send this application email to " + to +
+                   " from your connected Gmail account?")) {
+        return;
+      }
+
+      const button = $("sendApplicationEmailButton");
+      const status = $("applicationEmailStatus");
+      button.disabled = true;
+      status.textContent = "Sending email...";
+
+      try {
+        const response = await fetch("/api/gmail/send", {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+          },
+          body: JSON.stringify({ to, subject, body })
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          status.textContent = data.error ||
+            "Unable to send the email. Please check your Gmail connection.";
+          return;
+        }
+
+        alert("Application email sent successfully.");
+        closeApplicationEmail();
+      } catch (_) {
+        status.textContent =
+          "Could not reach the service. Check your connection and try again.";
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     function renderJobs() {
       const list = $("jobList");
       const jobs = getFilteredJobs();
@@ -1048,7 +1379,15 @@
           apply.addEventListener("click", () => window.open(url, "_blank", "noopener,noreferrer"));
         }
 
-        actions.append(match, apply);
+        const emailButton = document.createElement("button");
+        emailButton.className = "secondary";
+        emailButton.type = "button";
+        emailButton.textContent = "Email Application";
+        emailButton.addEventListener("click", () => {
+          openApplicationEmail(job);
+        });
+
+        actions.append(match, apply, emailButton);
         card.append(logo, info, actions);
         list.appendChild(card);
       });

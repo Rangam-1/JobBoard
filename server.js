@@ -9,6 +9,7 @@ const mammoth = require('mammoth');
 const pdfParse = require('pdf-parse');
 
 const crypto = require('crypto');
+const { google } = require('googleapis');
 const { CognitoJwtVerifier } = require('aws-jwt-verify');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
@@ -32,6 +33,73 @@ app.use((req, res, next) => { // Minimal cookie parser for the HttpOnly Cognito 
 const AUTH_CONFIGURED = ['AWS_REGION','COGNITO_USER_POOL_ID','COGNITO_CLIENT_ID','COGNITO_CLIENT_SECRET','COGNITO_DOMAIN','DYNAMODB_USERS_TABLE','PUBLIC_BASE_URL'].every(k => process.env[k]);
 const baseUrl = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const callbackUrl = `${baseUrl}/auth/callback`;
+
+// Google Gmail OAuth is separate from the existing Cognito OAuth flow.
+const googleRedirectUrl = process.env.GOOGLE_REDIRECT_URI || `${baseUrl}/auth/google/callback`;
+const gmailOAuthConfigured = () =>
+  Boolean(process.env.GOOGLE_CLIENT_ID &&
+          process.env.GOOGLE_CLIENT_SECRET &&
+          process.env.GOOGLE_REDIRECT_URI);
+
+function googleOAuthClient() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    googleRedirectUrl
+  );
+}
+
+function gmailEncryptionKey() {
+  const value = process.env.GMAIL_TOKEN_ENCRYPTION_KEY || '';
+  if (!/^[a-fA-F0-9]{64}$/.test(value)) {
+    throw new Error('Gmail token encryption key is missing or invalid');
+  }
+  return Buffer.from(value, 'hex');
+}
+
+function encryptGmailTokens(tokens) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', gmailEncryptionKey(), iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(tokens), 'utf8'),
+    cipher.final()
+  ]);
+  return JSON.stringify({
+    version: 1,
+    iv: iv.toString('hex'),
+    tag: cipher.getAuthTag().toString('hex'),
+    data: ciphertext.toString('hex')
+  });
+}
+
+function decryptGmailTokens(encrypted) {
+  if (!encrypted) return null;
+  const stored = JSON.parse(encrypted);
+  if (stored.version !== 1) throw new Error('Unsupported Gmail token format');
+  const decipher = crypto.createDecipheriv(
+    'aes-256-gcm',
+    gmailEncryptionKey(),
+    Buffer.from(stored.iv, 'hex')
+  );
+  decipher.setAuthTag(Buffer.from(stored.tag, 'hex'));
+  const cleartext = Buffer.concat([
+    decipher.update(Buffer.from(stored.data, 'hex')),
+    decipher.final()
+  ]).toString('utf8');
+  return JSON.parse(cleartext);
+}
+
+function validGoogleState(queryState, cookieState) {
+  if (typeof queryState !== 'string' ||
+      typeof cookieState !== 'string' ||
+      queryState.length !== 48 ||
+      cookieState.length !== 48) return false;
+
+  const a = Buffer.from(queryState);
+  const b = Buffer.from(cookieState);
+  return crypto.timingSafeEqual(a, b);
+}
+
 const cookieSecure = baseUrl.startsWith('https://');
 const cookieOptions = { httpOnly: true, secure: cookieSecure, sameSite: 'lax', path: '/', maxAge: 8 * 60 * 60 * 1000 };
 let ddb, verifier, idVerifier;
@@ -99,6 +167,267 @@ app.get('/api/me', requireConfigured, authenticated, async (req, res) => {
   const u = req.user;
   res.json({ authenticated: true, email: u.email, status: Number(u.expiresAt) <= Math.floor(Date.now()/1000) ? 'EXPIRED' : u.status, registeredAt: u.registeredAt, expiresAt: u.expiresAt, renewalStatus: u.renewalStatus || 'NONE' });
 });
+
+function profileText(value, maxLength) {
+  return String(value ?? '')
+    .replace(/[<>\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function profileResponse(user) {
+  return {
+    username: user.profileUsername || '',
+    yearsExperience: Number.isFinite(Number(user.profileYearsExperience))
+      ? Number(user.profileYearsExperience) : 0,
+    skills: user.profileSkills || '',
+    preferredRoles: user.profilePreferredRoles || '',
+    preferredLocations: user.profilePreferredLocations || '',
+    emailTemplate: user.profileEmailTemplate || ''
+  };
+}
+
+app.get('/api/profile', requireConfigured, authenticated, activeSubscription, async (req, res) => {
+  try {
+    res.set('Cache-Control', 'private, no-store');
+    res.json({ profile: profileResponse(req.user) });
+  } catch (error) {
+    console.error('Profile read failed:', error.message);
+    res.status(500).json({ error: 'Unable to load your profile.' });
+  }
+});
+
+app.put('/api/profile', requireConfigured, authenticated, activeSubscription, async (req, res) => {
+  try {
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      return res.status(400).json({ error: 'Please provide a valid profile.' });
+    }
+
+    const username = profileText(req.body.username, 80);
+    const experienceRaw = req.body.yearsExperience;
+    const yearsExperience = Number(experienceRaw);
+
+    if (!username) {
+      return res.status(400).json({ error: 'Username is required.' });
+    }
+
+    if (experienceRaw === '' || experienceRaw === null ||
+        experienceRaw === undefined || !Number.isFinite(yearsExperience) ||
+        yearsExperience < 0 || yearsExperience > 60) {
+      return res.status(400).json({ error: 'Experience must be a number from 0 to 60.' });
+    }
+
+    const skills = profileText(req.body.skills, 2000);
+    const preferredRoles = profileText(req.body.preferredRoles, 1000);
+    const preferredLocations = profileText(req.body.preferredLocations, 1000);
+    const emailTemplate = profileText(req.body.emailTemplate, 4000);
+
+    const values = {
+      ':username': username,
+      ':experience': yearsExperience,
+      ':skills': skills,
+      ':roles': preferredRoles,
+      ':locations': preferredLocations,
+      ':template': emailTemplate,
+      ':updatedAt': new Date().toISOString()
+    };
+
+    const result = await ddb.send(new UpdateCommand({
+      TableName: userTable(),
+      Key: userKey(req.claims.sub),
+      UpdateExpression: 'SET profileUsername = :username, profileYearsExperience = :experience, profileSkills = :skills, profilePreferredRoles = :roles, profilePreferredLocations = :locations, profileEmailTemplate = :template, profileUpdatedAt = :updatedAt',
+      ExpressionAttributeValues: values,
+      ReturnValues: 'ALL_NEW'
+    }));
+
+    res.set('Cache-Control', 'private, no-store');
+    res.json({ ok: true, profile: profileResponse(result.Attributes || {}) });
+  } catch (error) {
+    console.error('Profile save failed:', error.message);
+    res.status(500).json({ error: 'Unable to save your profile right now.' });
+  }
+});
+
+
+// Connect the currently signed-in user's own Google account.
+app.get('/auth/google', requireConfigured, authenticated, activeSubscription, (req, res) => {
+  if (!gmailOAuthConfigured()) {
+    return res.status(503).send('Google Gmail connection is not configured yet.');
+  }
+
+  const state = crypto.randomBytes(24).toString('hex');
+  res.cookie('ijh_google_oauth_state', state, {
+    ...cookieOptions,
+    maxAge: 10 * 60 * 1000
+  });
+
+  const url = googleOAuthClient().generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    include_granted_scopes: true,
+    scope: ['openid', 'email', 'https://www.googleapis.com/auth/gmail.send'],
+    state
+  });
+
+  res.redirect(url);
+});
+
+app.get('/auth/google/callback', requireConfigured, authenticated, activeSubscription, async (req, res) => {
+  res.clearCookie('ijh_google_oauth_state', { path: '/' });
+
+  if (!validGoogleState(req.query.state, req.cookies?.ijh_google_oauth_state)) {
+    return res.status(400).send('Invalid Google authorization state. Return to My Profile and try again.');
+  }
+
+  if (!req.query.code || !gmailOAuthConfigured()) {
+    return res.status(400).send('Google authorization could not be completed. Check configuration and try again.');
+  }
+
+  try {
+    const client = googleOAuthClient();
+    const { tokens } = await client.getToken(String(req.query.code));
+    if (!tokens.access_token) {
+      return res.status(400).send('Google did not return an access token. Please try again.');
+    }
+
+    client.setCredentials(tokens);
+    const identity = await google.oauth2({ version: 'v2', auth: client }).userinfo.get();
+    const connectedEmail = String(identity.data.email || '').trim().toLowerCase();
+
+    if (!connectedEmail || identity.data.verified_email !== true) {
+      return res.status(400).send('Google did not verify the connected email address.');
+    }
+
+    // Preserve an existing refresh token if Google omits one during reconnection.
+    const previous = req.user.gmailTokensEncrypted
+      ? decryptGmailTokens(req.user.gmailTokensEncrypted)
+      : {};
+    const mergedTokens = {
+      ...previous,
+      ...tokens,
+      refresh_token: tokens.refresh_token || previous.refresh_token
+    };
+
+    if (!mergedTokens.refresh_token) {
+      return res.status(400).send('Google did not provide offline access. Please reconnect and grant access.');
+    }
+
+    const encrypted = encryptGmailTokens(mergedTokens);
+    await ddb.send(new UpdateCommand({
+      TableName: userTable(),
+      Key: userKey(req.claims.sub),
+      UpdateExpression: 'SET gmailTokensEncrypted = :tokens, gmailConnectedEmail = :email, gmailConnectedAt = :now',
+      ExpressionAttributeValues: {
+        ':tokens': encrypted,
+        ':email': connectedEmail,
+        ':now': new Date().toISOString()
+      }
+    }));
+
+    res.redirect('/?gmail=connected');
+  } catch (error) {
+    // Do not log OAuth tokens, authorization codes, or provider response bodies.
+    console.error('Google Gmail connection failed:', error.message);
+    res.status(500).send('Unable to connect Gmail. Return to My Profile and try again.');
+  }
+});
+
+
+// Send one user-reviewed application email through the authenticated user's Gmail.
+app.post('/api/gmail/send', requireConfigured, authenticated, activeSubscription,
+  rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false }),
+  async (req, res) => {
+    res.set('Cache-Control', 'private, no-store');
+
+    const to = typeof req.body?.to === 'string' ? req.body.to.trim() : '';
+    const subject = typeof req.body?.subject === 'string' ? req.body.subject.trim() : '';
+    const body = typeof req.body?.body === 'string' ? req.body.body : '';
+
+    if (!to || to.length > 254 ||
+        !/^[^\s@,<>]+@[^\s@,<>]+\.[^\s@,<>]+$/.test(to)) {
+      return res.status(400).json({ error: 'Enter one valid recipient email address.' });
+    }
+
+    if (!subject || subject.length > 180 || /[\r\n]/.test(subject)) {
+      return res.status(400).json({ error: 'Enter a subject of up to 180 characters.' });
+    }
+
+    if (!body.trim() || body.length > 10000) {
+      return res.status(400).json({ error: 'Enter a message of up to 10,000 characters.' });
+    }
+
+    if (!req.user.gmailTokensEncrypted || !req.user.gmailConnectedEmail) {
+      return res.status(409).json({ error: 'Connect your Gmail account in My Profile first.' });
+    }
+
+    try {
+      const tokens = decryptGmailTokens(req.user.gmailTokensEncrypted);
+      if (!tokens || !tokens.refresh_token) {
+        return res.status(409).json({ error: 'Gmail authorization needs to be reconnected.' });
+      }
+
+      const client = googleOAuthClient();
+      client.setCredentials(tokens);
+
+      const encodedSubject = Buffer.from(subject, 'utf8').toString('base64');
+      const encodedBody = Buffer.from(body, 'utf8').toString('base64')
+        .match(/.{1,76}/g)?.join('\r\n') || '';
+
+      const mimeMessage = [
+        `To: ${to}`,
+        `From: ${req.user.gmailConnectedEmail}`,
+        `Subject: =?UTF-8?B?${encodedSubject}?=`,
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset="UTF-8"',
+        'Content-Transfer-Encoding: base64',
+        '',
+        encodedBody
+      ].join('\r\n');
+
+      const raw = Buffer.from(mimeMessage, 'utf8').toString('base64url');
+      const gmail = google.gmail({ version: 'v1', auth: client });
+      const result = await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: { raw }
+      });
+
+      return res.status(200).json({
+        ok: true,
+        messageId: result.data.id || null
+      });
+    } catch (error) {
+      console.error('Gmail send failed:', error.message);
+      return res.status(502).json({
+        error: 'Gmail could not send the email. Check your connection and try again.'
+      });
+    }
+  }
+);
+
+app.get('/api/gmail/status', requireConfigured, authenticated, activeSubscription, (req, res) => {
+  res.set('Cache-Control', 'private, no-store');
+  res.json({
+    connected: Boolean(req.user.gmailTokensEncrypted && req.user.gmailConnectedEmail),
+    email: req.user.gmailConnectedEmail || null,
+    connectedAt: req.user.gmailConnectedAt || null
+  });
+});
+
+app.post('/api/gmail/disconnect', requireConfigured, authenticated, activeSubscription, async (req, res) => {
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: userTable(),
+      Key: userKey(req.claims.sub),
+      UpdateExpression: 'REMOVE gmailTokensEncrypted, gmailConnectedEmail, gmailConnectedAt'
+    }));
+    res.set('Cache-Control', 'private, no-store');
+    res.json({ ok: true, connected: false });
+  } catch (error) {
+    console.error('Gmail disconnect failed:', error.message);
+    res.status(500).json({ error: 'Unable to disconnect Gmail right now.' });
+  }
+});
+
 app.post('/api/renewal-request', requireConfigured, authenticated, async (req, res) => {
   const now = new Date().toISOString();
   await ddb.send(new UpdateCommand({ TableName: userTable(), Key: userKey(req.claims.sub), UpdateExpression: 'SET renewalStatus = :pending, renewalRequestedAt = :now', ExpressionAttributeValues: { ':pending': 'PENDING', ':now': now } }));
@@ -109,7 +438,7 @@ const TRACKS = {
   'AWS DevOps': ['AWS DevOps', 'DevOps Engineer AWS', 'Cloud DevOps Engineer', 'Platform Engineer AWS', 'SRE AWS'],
   'SAP ABAP': ['SAP ABAP', 'ABAP Developer', 'SAP Technical Consultant', 'S/4HANA ABAP'],
   'TOSCA Testing': ['Tricentis Tosca', 'TOSCA Test Automation', 'Tosca Automation Engineer', 'Tosca QA'],
-  'Quadient Inspire': ['Quadient Inspire', 'GMC Inspire', 'Customer Communications Management', 'CCM Developer']
+  'Quadient Inspire': ['Quadient Inspire', 'GMC Inspire', 'Quadient Inspire Developer', 'GMC Inspire Developer']
 };
 const ALLOWED_TRACKS = Object.keys(TRACKS);
 const clean = (s, max = 120) => String(s || '').replace(/[<>\u0000-\u001f]/g, '').trim().slice(0, max);
@@ -119,15 +448,30 @@ const isIndiaOrRemote = job => {
   const india = /india|bengaluru|bangalore|hyderabad|pune|chennai|mumbai|gurugram|gurgaon|noida|delhi|kolkata|kochi|ahmedabad|indore|jaipur|thiruvananthapuram|visakhapatnam|coimbatore/.test(loc);
   return remote || india;
 };
+function normalizePostedAt(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  // Some providers return Unix timestamps in seconds; Date.parse()
+  // does not interpret numeric seconds as Unix timestamps.
+  if (typeof value === 'number' || /^\d{10,13}$/.test(String(value))) {
+    const timestamp = Number(value);
+    const milliseconds = timestamp < 1e12 ? timestamp * 1000 : timestamp;
+    const date = new Date(milliseconds);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+
+  return value;
+}
+
 const normalize = (j, source) => ({
-  id: String(j.id || j.url || `${source}-${j.title}-${j.company}`).slice(0, 500),
+  id: String(j.id || j.url || j.link || `${source}-${j.title}-${j.company}`).slice(0, 500),
   title: clean(j.title, 220) || 'Untitled role',
   company: clean(j.company || j.company_name || j.companyName || 'Company not listed', 180),
   location: clean(j.location || j.candidate_required_location || j.city || 'India / Remote', 180),
-  description: clean((j.description || j.description_text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' '), 700),
-  url: safeUrl(j.url || j.redirect_url || j.apply_url || j.job_url),
+  description: clean((j.description || j.description_text || j.snippet || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' '), 700),
+  url: safeUrl(j.url || j.link || j.redirect_url || j.apply_url || j.job_url),
   source,
-  postedAt: j.created || j.created_at || j.publication_date || j.date || null,
+  postedAt: normalizePostedAt(j.updated || j.created || j.created_at || j.publication_date || j.date || null),
   remote: /remote|work from home|anywhere/i.test(`${j.location || ''} ${j.candidate_required_location || ''} ${j.title || ''}`)
 });
 function safeUrl(value) {
@@ -163,6 +507,55 @@ async function getAdzuna(track) {
   const data = await fetchJson(url);
   return (data.results || []).map(j => normalize({ ...j, location: j.location?.display_name || 'India' }, 'Adzuna'));
 }
+async function getJooble(track) {
+  const apiKey = process.env.JOOBLE_API_KEY?.trim();
+  if (!apiKey) return [];
+
+  const searchTerms = (TRACKS[track] || [track]).slice(0, 4);
+  const results = await Promise.allSettled(searchTerms.map(async keywords => {
+    const response = await fetch(
+      `https://in.jooble.org/api/${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'IndiaJobHub/1.0 (job search aggregator)'
+        },
+        body: JSON.stringify({ keywords, location: 'India' }),
+        signal: AbortSignal.timeout(15000)
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Jooble returned HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    return (data.jobs || []).map(j => normalize({
+      ...j,
+      url: j.link,
+      description: j.description || j.description_text || j.snippet || '',
+      location: j.location || 'India'
+    }, 'Jooble'));
+  }));
+
+  const jobs = [];
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      jobs.push(...result.value);
+    } else {
+      console.error(`[job-discovery] Jooble query failed for ${track}: ${result.reason?.message || 'unknown error'}`);
+    }
+  }
+
+  const seen = new Set();
+  return jobs.filter(job => {
+    const key = job.url || `${job.title}|${job.company}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 async function getArbeitnow(track) {
   // Public API. It is global; filter to India/remote and relevant titles below.
   const data = await fetchJson('https://www.arbeitnow.com/api/job-board-api');
@@ -191,8 +584,14 @@ async function refreshTrackJobs(track) {
   if (refreshInProgress.has(track)) return refreshInProgress.get(track);
   const task = (async () => {
     const startedAt = new Date().toISOString();
-    const sources = await Promise.allSettled([getAdzuna(track), getArbeitnow(track), getRemotive(track)]);
+    const sources = await Promise.allSettled([Promise.resolve([]), getArbeitnow(track), getRemotive(track), getJooble(track)]);
+    const sourceNames = ['Adzuna (disabled)', 'Arbeitnow', 'Remotive', 'Jooble'];
+    console.log(`[job-discovery] ${track}: ` + sources.map((s, i) =>
+      `${sourceNames[i]}=${s.status === 'fulfilled' ? s.value.length : 'failed'}`
+    ).join(', '));
+
     let jobs = sources.flatMap(s => s.status === 'fulfilled' ? s.value : []);
+    const fetchedCount = jobs.length;
     const cutoff = Date.now() - JOB_POSTED_WITHIN_DAYS * 24 * 60 * 60 * 1000;
     // Exclude listings without a parseable posting date: we cannot prove they are within the selected window.
     jobs = jobs.filter(j => {
@@ -200,13 +599,76 @@ async function refreshTrackJobs(track) {
       const posted = Date.parse(j.postedAt);
       return Number.isFinite(posted) && posted <= Date.now() && posted >= cutoff;
     });
-    const seen = new Set();
+    console.log(`[job-discovery] ${track}: fetched=${fetchedCount}, afterDateAndLocationFilters=${jobs.length}`);
+
+    const relevanceRules = {
+      'AWS DevOps': /\b(aws|amazon web services)\b/i,
+      'SAP ABAP': /\b(abap|s\/4hana)\b/i,
+      'TOSCA Testing': /\b(tosca|tricentis)\b/i,
+      'Quadient Inspire': /\b(quadient\s+inspire|gmc\s+inspire)\b/i
+    };
+
+    const relevantJob = (job) => {
+      const title = job.title || '';
+
+      if (track === 'AWS DevOps') {
+        return relevanceRules[track].test(title)
+          && /\b(devops|site reliability|sre|cloud engineer|platform engineer|cloud architect)\b/i.test(title);
+      }
+
+      if (track === 'Quadient Inspire') {
+        const text = `${title} ${job.description || ''}`;
+        return /\b(quadient\s+inspire|gmc\s+inspire)\b/i.test(text);
+      }
+
+      return relevanceRules[track]?.test(title) === true;
+    };
+
+    const beforeRelevance = jobs.length;
+    jobs = jobs.filter(relevantJob);
+    console.log(`[job-discovery] ${track}: afterRelevanceFilter=${jobs.length}; excluded=${beforeRelevance - jobs.length}`);
+    console.log(`[job-discovery] ${track} samples: ` + jobs.slice(0, 8).map(j =>
+      `${j.title} | ${j.company} | ${j.location} | ${j.postedAt}`
+    ).join(' || '));
+
+    const seenUrls = new Set();
+    const seenJobs = new Set();
+    const beforeDeduplication = jobs.length;
+
     jobs = jobs.filter(j => {
-      const k = `${j.title.toLowerCase()}|${j.company.toLowerCase()}|${j.url}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
+      let normalizedUrl = '';
+      try {
+        const u = new URL(j.url);
+        u.hash = '';
+        for (const key of [...u.searchParams.keys()]) {
+          if (/^(utm_.+|fbclid|gclid|ref|source|tracking|trk|campaign)$/i.test(key)) {
+            u.searchParams.delete(key);
+          }
+        }
+        normalizedUrl = u.href.replace(/\/$/, '').toLowerCase();
+      } catch {}
+
+      const normalizeKey = value =>
+        String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+      const titleKey = normalizeKey(j.title);
+      const companyKey = normalizeKey(j.company);
+      const locationKey = normalizeKey(j.location);
+      const dateKey = String(j.postedAt || '').slice(0, 10);
+      const jobKey = `${titleKey}|${companyKey}|${locationKey}|${dateKey}`;
+
+      if ((normalizedUrl && seenUrls.has(normalizedUrl)) || seenJobs.has(jobKey)) {
+        return false;
+      }
+
+      if (normalizedUrl) seenUrls.add(normalizedUrl);
+      seenJobs.add(jobKey);
       return true;
     });
+
+    console.log(
+      `[job-discovery] ${track}: afterDeduplication=${jobs.length}; duplicatesRemoved=${beforeDeduplication - jobs.length}`
+    );
     jobs.sort((a, b) => Date.parse(b.postedAt) - Date.parse(a.postedAt));
     const result = {
       jobs,
@@ -215,7 +677,8 @@ async function refreshTrackJobs(track) {
       sources: {
         adzuna: sources[0].status === 'fulfilled' ? 'ok' : 'unavailable',
         arbeitnow: sources[1].status === 'fulfilled' ? 'ok' : 'unavailable',
-        remotive: sources[2].status === 'fulfilled' ? 'ok' : 'unavailable'
+        remotive: sources[2].status === 'fulfilled' ? 'ok' : 'unavailable',
+        jooble: sources[3].status === 'fulfilled' ? 'ok' : 'unavailable'
       }
     };
     jobCache.set(track, result);
@@ -259,7 +722,7 @@ app.get('/api/jobs', requireConfigured, authenticated, activeSubscription, async
   res.json({
     track, mode, total: jobs.length, jobs: jobs.slice(0, 100), links: makeSearchLinks(track, mode),
     discovery: { postingWindowDays: JOB_POSTED_WITHIN_DAYS, sort: process.env.JOB_SORT === 'oldest' ? 'oldest' : 'newest', refreshIntervalHours: JOB_REFRESH_INTERVAL_HOURS, refreshedAt: cached.refreshedAt, sourceStatus: cached.sources },
-    sourceStatus: { adzunaConfigured: Boolean(process.env.ADZUNA_APP_ID && process.env.ADZUNA_APP_KEY), publicSources: ['Arbeitnow', 'Remotive'] },
+    sourceStatus: { adzunaConfigured: false, joobleConfigured: Boolean(process.env.JOOBLE_API_KEY?.trim()), publicSources: ['Arbeitnow', 'Remotive', 'Jooble'] },
     note: 'Only listings with a parseable posting date inside the selected window are shown. Results depend on provider API coverage and terms. Portal links open official search pages; this app does not scrape LinkedIn or Naukri.'
   });
 });
